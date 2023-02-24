@@ -1,24 +1,45 @@
 use dotenv::dotenv;
 use actix_web::{web, App, HttpServer, Responder, HttpResponse, http::header};
-use sqlx::{postgres::PgPool};
+use sqlx::postgres::PgPool;
+use sqlx::query;
 use serde::{Serialize, Deserialize};
 use env_logger;
+use url::Url;
+use uuid::Uuid;
 
-#[derive(Serialize, Deserialize)]
+const HOSTNAME: &str = "127.0.0.1";
+
+#[derive(Serialize)]
 struct URLStruct {
     url: String
 }
 
+#[derive(Deserialize)]
+struct InputURLStruct {
+    url_id: Option<String>,
+    url: String
+}
+
+fn generate_url_safe_id() -> String {
+    let mut url_safe_id = String::new();
+    let generated_id = Uuid::new_v4().to_string();
+    for char in generated_id.chars() {
+        if char != '-' {
+            url_safe_id.push(char);
+        }
+    }
+    url_safe_id
+}
 
 async fn urls(db: web::Data<PgPool>) -> impl Responder {
-    let url_shorteners = sqlx::query!("SELECT * FROM shortened_url;")
+    let url_shorteners = query!("SELECT * FROM shortened_url;")
         .fetch_all(db.as_ref())
         .await
         .expect("Failed to perform query!");
     let urls: Vec<URLStruct> = url_shorteners.iter().map(|record| -> URLStruct {
         let url_id = record.url_id.as_ref().unwrap();
         URLStruct {
-            url: format!("127.0.0.1:8888/{}", url_id)
+            url: format!("{HOSTNAME}/{url_id}")
         }
     }).collect();  
 
@@ -28,7 +49,7 @@ async fn urls(db: web::Data<PgPool>) -> impl Responder {
 
 async fn short_link(db: web::Data<PgPool>, params: web::Path<(String,)>) -> impl Responder {
     let (url_id,) = params.into_inner();
-    let url_rows = sqlx::query!("SELECT * FROM shortened_url WHERE url_id = $1 LIMIT 1;", url_id)
+    let url_rows = query!("SELECT * FROM shortened_url WHERE url_id = $1 LIMIT 1;", url_id)
         .fetch_all(db.as_ref())
         .await
         .expect("Failed to perform query!");
@@ -42,10 +63,29 @@ async fn short_link(db: web::Data<PgPool>, params: web::Path<(String,)>) -> impl
     response.body("Redirecting...")
 }
 
-// TODO: Implement creating URLs. 
-async fn create_shortened_url(db: web::Data<PgPool>, body: web::Json<URLStruct>) -> impl Responder {
 
-    HttpResponse::Created().body("URL successfully created.")
+async fn create_shortened_url(db: web::Data<PgPool>, body: web::Json<InputURLStruct>) -> impl Responder {
+    let url = body.0.url;
+    if let Err(_) = Url::parse(url.as_str()) {
+        return HttpResponse::UnprocessableEntity().body("Invalid URL!");
+    }
+    if let Some(custom_id) = body.0.url_id {
+        let _ = query!("INSERT INTO shortened_url(url_id, url) VALUES ($1, $2);", custom_id, url)
+            .execute(db.as_ref())
+            .await
+            .expect("Failed to perform query!");
+        return HttpResponse::Created().json(URLStruct {
+            url: format!("{HOSTNAME}/{custom_id}")
+        });
+    }
+    let new_url_id = generate_url_safe_id();
+    let _ = query!("INSERT INTO shortened_url(url_id, url) VALUES ($1, $2);", new_url_id, url)
+        .execute(db.as_ref())
+        .await
+        .expect("Failed to perform query!");
+    HttpResponse::Created().json(URLStruct {
+        url: format!("127.0.0.1:8888/{new_url_id}")
+    })
 }
 
 #[actix_web::main]
@@ -61,7 +101,8 @@ async fn main() -> std::io::Result<()> {
         App::new()
             .app_data(pool.clone())
             .route("/", web::get().to(urls))
-            .route("/redirect/{url_id}", web::get().to(short_link))
+            .route("/sl/{url_id}", web::get().to(short_link))
+            .route("/create", web::post().to(create_shortened_url))
     })   
     .bind(("127.0.0.1", 8888))?
     .run()
